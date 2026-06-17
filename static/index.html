@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Voice Agent</title>
 <style>
-  /* ── Tokens ── */
   :root {
     --bg:        #0d0f14;
     --surface:   #161920;
@@ -38,7 +37,6 @@
     gap: 32px;
   }
 
-  /* ── Orb ── */
   .orb-wrap {
     position: relative;
     width: 140px;
@@ -60,13 +58,9 @@
   }
 
   .orb svg { opacity: .85; }
-
   .orb-wrap:hover .orb { transform: scale(1.05); }
 
-  .orb-wrap.idle .orb {
-    animation: idle-pulse 3s ease-in-out infinite;
-  }
-
+  .orb-wrap.idle .orb { animation: idle-pulse 3s ease-in-out infinite; }
   @keyframes idle-pulse {
     0%,100% { box-shadow: 0 0 0 0 rgba(91,124,250,.3); }
     50%      { box-shadow: 0 0 0 18px rgba(91,124,250,.0); }
@@ -76,7 +70,6 @@
     animation: listen-scale 0.7s ease-in-out infinite alternate;
     box-shadow: 0 0 0 10px rgba(91,124,250,.2), 0 0 0 22px rgba(91,124,250,.08);
   }
-
   @keyframes listen-scale {
     from { transform: scale(1.0); }
     to   { transform: scale(1.06); }
@@ -87,7 +80,6 @@
     box-shadow: 0 0 0 12px rgba(62,207,142,.18), 0 0 0 26px rgba(62,207,142,.06);
     animation: speak-pulse 0.6s ease-in-out infinite alternate;
   }
-
   @keyframes speak-pulse {
     from { transform: scale(1.0); box-shadow: 0 0 0 8px rgba(62,207,142,.2); }
     to   { transform: scale(1.07); box-shadow: 0 0 0 24px rgba(62,207,142,.04); }
@@ -97,7 +89,6 @@
     background: radial-gradient(circle at 38% 36%, #ff8f80 0%, #d63520 45%, #7a1008 100%);
   }
 
-  /* ── Status label ── */
   .status-label {
     font-size: 13px;
     font-weight: 500;
@@ -108,12 +99,10 @@
     min-height: 20px;
     transition: color .3s;
   }
-
-  .status-label.active { color: var(--accent); }
+  .status-label.active   { color: var(--accent); }
   .status-label.speaking { color: var(--green); }
-  .status-label.error { color: var(--red); }
+  .status-label.error    { color: var(--red); }
 
-  /* ── Transcript panel ── */
   .transcript-wrap {
     width: 100%;
     max-width: 560px;
@@ -147,13 +136,7 @@
   .transcript-body::-webkit-scrollbar-track { background: transparent; }
   .transcript-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-  .msg {
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    max-width: 88%;
-  }
-
+  .msg { display: flex; flex-direction: column; gap: 3px; max-width: 88%; }
   .msg.user  { align-self: flex-end; align-items: flex-end; }
   .msg.agent { align-self: flex-start; align-items: flex-start; }
 
@@ -172,21 +155,10 @@
     line-height: 1.5;
   }
 
-  .msg.user  .msg-bubble {
-    background: var(--accent-lo);
-    border: 1px solid var(--accent);
-    color: var(--text);
-  }
+  .msg.user  .msg-bubble { background: var(--accent-lo); border: 1px solid var(--accent); color: var(--text); }
+  .msg.agent .msg-bubble { background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text); }
 
-  .msg.agent .msg-bubble {
-    background: rgba(255,255,255,.04);
-    border: 1px solid var(--border);
-    color: var(--text);
-  }
-
-  .msg-bubble.interrupted {
-    opacity: .55;
-  }
+  .msg-bubble.interrupted { opacity: .55; }
   .msg-bubble.interrupted::after {
     content: " (interrupted)";
     font-size: 11px;
@@ -194,12 +166,7 @@
     color: var(--muted);
   }
 
-  /* ── Controls ── */
-  .controls {
-    display: flex;
-    gap: 12px;
-    align-items: center;
-  }
+  .controls { display: flex; gap: 12px; align-items: center; }
 
   .btn {
     padding: 10px 22px;
@@ -213,25 +180,13 @@
     cursor: pointer;
     transition: background .15s, border-color .15s, opacity .15s;
   }
-
-  .btn:hover   { background: var(--border); }
+  .btn:hover    { background: var(--border); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
-
-  .btn.primary {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #fff;
-  }
+  .btn.primary  { background: var(--accent); border-color: var(--accent); color: #fff; }
   .btn.primary:hover { background: #4a6ee8; }
+  .btn.danger   { background: rgba(240,97,74,.12); border-color: var(--red); color: var(--red); }
+  .btn.danger:hover  { background: rgba(240,97,74,.22); }
 
-  .btn.danger {
-    background: rgba(240,97,74,.12);
-    border-color: var(--red);
-    color: var(--red);
-  }
-  .btn.danger:hover { background: rgba(240,97,74,.22); }
-
-  /* ── Volume meter ── */
   .vol-bar-wrap {
     width: 100%;
     max-width: 560px;
@@ -251,17 +206,11 @@
     transition: width .05s linear;
   }
 
-  /* ── Footer ── */
-  .footer {
-    font-size: 11px;
-    color: var(--muted);
-    text-align: center;
-  }
+  .footer { font-size: 11px; color: var(--muted); text-align: center; }
 </style>
 </head>
 <body>
 
-<!-- Orb -->
 <div class="orb-wrap idle" id="orb" title="Click to start / stop">
   <div class="orb">
     <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
@@ -273,15 +222,12 @@
   </div>
 </div>
 
-<!-- Status -->
 <div class="status-label" id="statusLabel">Click the orb to start</div>
 
-<!-- Volume meter -->
 <div class="vol-bar-wrap" id="volWrap">
   <div class="vol-bar" id="volBar"></div>
 </div>
 
-<!-- Transcript -->
 <div class="transcript-wrap">
   <div class="transcript-header">Transcript</div>
   <div class="transcript-body" id="transcriptBody">
@@ -291,40 +237,45 @@
   </div>
 </div>
 
-<!-- Controls -->
 <div class="controls">
   <button class="btn primary" id="startBtn">Start</button>
   <button class="btn danger"  id="stopBtn" disabled>End Session</button>
 </div>
 
-<div class="footer">WebRTC · Deepgram Nova-3 · GPT-4.1-mini · OpenAI TTS-1</div>
+<div class="footer">WebRTC · Deepgram Nova-3 · GPT-4.1-mini · Cartesia Sonic-2</div>
 
 <script>
-// ─── State ─────────────────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 let ws          = null;
 let pc          = null;
 let localStream = null;
-let micCtx      = null;   // AudioContext used only for the input volume meter
+let micCtx      = null;
 let analyser    = null;
 let volRaf      = null;
 let firstMsg    = true;
 
-// ── TTS playback state ──────────────────────────────────────────────────────
-// Audio chunks are no longer buffered into one big Blob and played after
-// tts_end. Instead each binary WS message is:
-//   [4 bytes turn_id][4 bytes seq_in_turn][mp3 chunk bytes]
-// We decode each chunk as it arrives and schedule it on a single persistent
-// AudioContext, gapless, using an ever-advancing "next start time" cursor.
-// `currentTurnId` is the single source of truth for "what should be
-// audible right now". Every async callback (decode, schedule, play) checks
-// against it before doing anything observable, so a stale turn can NEVER
-// produce sound after a newer turn has started or an interrupt fired —
-// even if messages/promises resolve out of order.
-let playCtx        = null;          // AudioContext for TTS playback (separate from mic meter ctx)
-let currentTurnId  = -1;            // the only turn allowed to produce audio right now
-let nextStartTime  = 0;             // when the next scheduled chunk should begin, in playCtx time
-let activeSources  = [];            // currently scheduled/playing AudioBufferSourceNodes for the current turn
-let turnMsgEl      = null;          // transcript bubble element for the in-progress agent turn
+// ─── TTS playback (raw PCM s16le from Cartesia SSE) ──────────────────────────
+// Cartesia's SSE endpoint only supports raw PCM output (container=raw,
+// encoding=pcm_s16le). We can't feed raw PCM into decodeAudioData() — that
+// only accepts complete encoded files (mp3/wav/ogg). Instead we:
+//   1. Convert each chunk's Int16 samples → Float32
+//   2. Create an AudioBuffer directly (no decode needed — it's already PCM)
+//   3. Schedule it gaplessly on a shared AudioContext using nextStartTime
+//
+// Turn-gating and barge-in logic (playGen, currentTurnId, masterGain) are
+// identical to the previous mp3 version — only the chunk→AudioBuffer
+// conversion changes.
+
+let playCtx       = null;
+let masterGain    = null;
+let currentTurnId = -1;
+let nextStartTime = 0;
+let activeSources = [];
+let turnMsgEl     = null;
+let playGen       = 0;
+
+// Sample rate sent by server in tts_start message (default 22050)
+let ttsSampleRate = 22050;
 
 const orb            = document.getElementById("orb");
 const statusLabel    = document.getElementById("statusLabel");
@@ -334,21 +285,15 @@ const transcriptBody = document.getElementById("transcriptBody");
 const startBtn       = document.getElementById("startBtn");
 const stopBtn        = document.getElementById("stopBtn");
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function setStatus(text, cls = "") {
   statusLabel.textContent = text;
   statusLabel.className   = "status-label" + (cls ? ` ${cls}` : "");
 }
-
-function setOrbState(state) {
-  orb.className = `orb-wrap ${state}`;
-}
+function setOrbState(state) { orb.className = `orb-wrap ${state}`; }
 
 function addMessage(text, speaker) {
-  if (firstMsg) {
-    transcriptBody.innerHTML = "";
-    firstMsg = false;
-  }
+  if (firstMsg) { transcriptBody.innerHTML = ""; firstMsg = false; }
   const d = document.createElement("div");
   d.className = `msg ${speaker}`;
   d.innerHTML = `
@@ -360,27 +305,22 @@ function addMessage(text, speaker) {
   return d.querySelector(".msg-bubble");
 }
 
-function markBubbleInterrupted(bubbleEl) {
-  if (bubbleEl) bubbleEl.classList.add("interrupted");
-}
-
+function markBubbleInterrupted(el) { if (el) el.classList.add("interrupted"); }
 function escapeHtml(s) {
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
-// ─── Input volume meter (separate AudioContext from TTS playback) ───────────
+// ─── Input volume meter ───────────────────────────────────────────────────────
 function startVolMeter(stream) {
-  micCtx = new AudioContext();
+  micCtx   = new AudioContext();
   analyser = micCtx.createAnalyser();
   analyser.fftSize = 256;
-  const src = micCtx.createMediaStreamSource(stream);
-  src.connect(analyser);
+  micCtx.createMediaStreamSource(stream).connect(analyser);
   const data = new Uint8Array(analyser.frequencyBinCount);
   volWrap.classList.add("active");
-
   function tick() {
     analyser.getByteFrequencyData(data);
-    const avg = data.reduce((a, b) => a + b, 0) / data.length;
+    const avg = data.reduce((a,b) => a+b, 0) / data.length;
     volBar.style.width = Math.min(100, avg * 2) + "%";
     volRaf = requestAnimationFrame(tick);
   }
@@ -394,102 +334,100 @@ function stopVolMeter() {
   if (micCtx) { micCtx.close(); micCtx = null; }
 }
 
-// ─── TTS playback (streaming, turn-gated) ────────────────────────────────────
-
-// ── Why the previous version still let old + new audio overlap ──────────────
-// ws.onmessage called `handleAudioChunk(ev.data)` WITHOUT awaiting it. Each
-// call was its own async function with its own `await ctx.decodeAudioData`.
-// When 4-5 chunks arrive within a few ms (normal — the server streams 4KB
-// chunks back-to-back), that produces 4-5 CONCURRENT decodes racing each
-// other. Each one rechecked `turnId !== currentTurnId` after its own await,
-// but that only guards that one chunk — it does nothing to stop a chunk
-// whose decode happened to resolve and call `.start()` in the gap between
-// "interrupt handler starts mutating state" and "this chunk's own check
-// runs". With concurrent promises there's no guaranteed ordering there —
-// that gap was the actual bug behind the overlapping audio.
-//
-// Fix, two parts:
-//   1. A monotonic `playGen` counter, separate from turn_id, bumped FIRST
-//      and SYNCHRONOUSLY inside onTtsStart/onInterrupt/resetTtsPlaybackState
-//      before anything else runs. Any chunk whose closure captured an older
-//      `playGen` is permanently stale with no race window — even with ten
-//      decodes in flight, only chunks started under the CURRENT generation
-//      can ever reach `.start()`.
-//   2. Chunks are drained one at a time through `chunkQueue` instead of
-//      firing concurrently — only one decodeAudioData() in flight ever, so
-//      there's no concurrent-decode race to begin with, and chunk order is
-//      preserved regardless of per-chunk decode time.
-// `stopAllActiveSources()` also hard-mutes a shared gain node to 0 BEFORE
-// calling .stop() on anything, so even a source that started in the same
-// tick as the interrupt is silent immediately rather than for a few ms
-// while .stop() takes effect.
-
-let playGen       = 0;     // bumped on every interrupt / new turn / session stop
-let chunkQueue     = [];   // pending {turnId, gen, mp3Bytes}, drained sequentially
-let drainingQueue  = false;
-let masterGain     = null; // all sources route through this, for instant hard-mute
-
+// ─── AudioContext setup ───────────────────────────────────────────────────────
 function ensurePlayCtx() {
   if (!playCtx) {
-    playCtx = new (window.AudioContext || window.webkitAudioContext)();
+    playCtx    = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: ttsSampleRate });
     masterGain = playCtx.createGain();
     masterGain.gain.value = 1;
     masterGain.connect(playCtx.destination);
   }
-  // Browsers can suspend a context created/resumed outside a user gesture.
-  // startSession() is itself triggered by a click, so this resume call is
-  // inside that gesture chain and should succeed.
-  if (playCtx.state === "suspended") {
-    playCtx.resume().catch(() => {});
-  }
+  if (playCtx.state === "suspended") playCtx.resume().catch(() => {});
   return playCtx;
 }
 
-// Hard, synchronous stop: mute instantly via gain, THEN stop every node.
-// The gain drop to 0 happens in the same tick — no audible gap waiting on
-// .stop()'s internal scheduling, and it covers any source that might start
-// in the same tick as this call before its .stop() takes effect.
 function stopAllActiveSources() {
   if (masterGain && playCtx) {
     masterGain.gain.cancelScheduledValues(playCtx.currentTime);
     masterGain.gain.setValueAtTime(0, playCtx.currentTime);
   }
   for (const src of activeSources) {
-    try { src.stop(); } catch (e) { /* already stopped/ended — fine */ }
+    try { src.stop(); } catch(e) {}
   }
   activeSources = [];
-  chunkQueue = [];
-  // Restore gain for the NEXT turn. Safe immediately — nothing is
-  // connected/playing through it yet since activeSources is now empty.
   if (masterGain && playCtx) {
     masterGain.gain.setValueAtTime(1, playCtx.currentTime);
   }
 }
 
-function onTtsStart(turnId) {
-  // Bump generation FIRST, synchronously — this is what makes every
-  // in-flight chunk from the previous turn unconditionally stale the
-  // instant this function starts running, with no race window.
+// ─── Convert raw pcm_s16le bytes → AudioBuffer (NO decodeAudioData needed) ───
+// This is the KEY change from the mp3 version. Raw PCM doesn't need decoding —
+// we just reinterpret the bytes as Int16 samples and normalize to Float32 [-1,1].
+function pcmBytesToAudioBuffer(arrayBuffer, sampleRate) {
+  const int16   = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768.0;   // normalize s16 → float [-1, 1]
+  }
+  const ctx    = ensurePlayCtx();
+  const buffer = ctx.createBuffer(1, float32.length, sampleRate);
+  buffer.copyToChannel(float32, 0);
+  return buffer;
+}
+
+// ─── Schedule one PCM chunk for gapless playback ─────────────────────────────
+function scheduleChunk(arrayBuffer, turnId, gen) {
+  // Both checks must pass — gen covers the race between "chunk arrives" and
+  // "interrupt fires", turnId covers cross-turn confusion.
+  if (gen !== playGen || turnId !== currentTurnId) return;
+
+  const ctx    = ensurePlayCtx();
+  // Strip the 8-byte header [turn_id u32][seq u32] — remaining bytes are PCM
+  const pcmBuf = arrayBuffer.slice(8);
+  if (pcmBuf.byteLength === 0) return;
+
+  const audioBuffer = pcmBytesToAudioBuffer(pcmBuf, ttsSampleRate);
+
+  const source = ctx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(masterGain);
+
+  const startAt  = Math.max(nextStartTime, ctx.currentTime);
+  source.start(startAt);
+  nextStartTime  = startAt + audioBuffer.duration;
+
+  activeSources.push(source);
+  source.onended = () => {
+    activeSources = activeSources.filter(s => s !== source);
+    // All chunks for this turn have finished playing → flip back to listening
+    if (activeSources.length === 0 && turnId === currentTurnId && gen === playGen) {
+      setOrbState("listening");
+      setStatus("Listening…", "active");
+    }
+  };
+}
+
+// ─── TTS event handlers ───────────────────────────────────────────────────────
+function onTtsStart(msg) {
   playGen += 1;
+
+  // Update sample rate from server message (sent in tts_start)
+  if (msg.sample_rate) ttsSampleRate = msg.sample_rate;
 
   if (turnMsgEl) markBubbleInterrupted(turnMsgEl);
   stopAllActiveSources();
 
-  currentTurnId = turnId;
-  const ctx = ensurePlayCtx();
+  currentTurnId = msg.turn_id;
+  const ctx     = ensurePlayCtx();
   nextStartTime = ctx.currentTime;
+  turnMsgEl     = null;
 
-  turnMsgEl = null; // will be set when the transcript text for this turn arrives
   setOrbState("speaking");
   setStatus("Agent speaking…", "speaking");
 }
 
 function onTtsEnd(turnId) {
-  if (turnId !== currentTurnId) return; // stale tts_end for a superseded turn — ignore
-  // Don't flip UI state here: the audio for this turn may still be playing
-  // out (scheduled chunks can run past when the last byte arrived). The
-  // last scheduled source's onended handler flips the UI back to listening.
-  // If there were zero chunks at all (e.g. empty TTS), fall back here.
+  if (turnId !== currentTurnId) return;
   if (activeSources.length === 0) {
     setOrbState("listening");
     setStatus("Listening…", "active");
@@ -497,81 +435,24 @@ function onTtsEnd(turnId) {
 }
 
 function onInterrupt(turnId) {
-  // Bump generation FIRST — same reasoning as onTtsStart. This only fires
-  // after the SERVER's VAD has already confirmed a real utterance (see
-  // server.py VAD_MIN_SPEECH_FRAMES — short noise pops/breaths never reach
-  // the point of sending "interrupt" at all), so by the time this runs,
-  // background noise has already been ruled out upstream.
   playGen += 1;
-
-  if (turnId === currentTurnId || turnId === -1) {
-    if (turnMsgEl) markBubbleInterrupted(turnMsgEl);
-  }
+  if (turnId === currentTurnId || turnId === -1) markBubbleInterrupted(turnMsgEl);
   stopAllActiveSources();
   setOrbState("listening");
   setStatus("Listening…", "active");
   currentTurnId = -1;
 }
 
-// Each binary WS message: [u32 turn_id][u32 seq_in_turn][mp3 bytes...]
-// Chunks are queued and drained one at a time by drainChunkQueue() — never
-// processed concurrently — so there's exactly one decodeAudioData() in
-// flight at any moment and no race between "decode resolves" and
-// "interrupt mutates shared state".
+// ─── Binary message handler ───────────────────────────────────────────────────
+// Raw PCM path: no async decode, no queue needed.
+// pcmBytesToAudioBuffer() is synchronous so there's zero race window —
+// the gen/turnId checks and the schedule happen in the same microtask.
 function handleAudioChunk(buf) {
   if (buf.byteLength < 8) return;
   const view   = new DataView(buf);
-  const turnId = view.getUint32(0, false);  // big-endian, matches server's ">II"
-  const mp3Bytes = buf.slice(8);
-
-  if (turnId !== currentTurnId) return; // stale turn — never even queue it
-
-  chunkQueue.push({ turnId, gen: playGen, mp3Bytes });
-  if (!drainingQueue) drainChunkQueue();
-}
-
-async function drainChunkQueue() {
-  drainingQueue = true;
-  while (chunkQueue.length > 0) {
-    const { turnId, gen, mp3Bytes } = chunkQueue.shift();
-
-    // Stale before we even start decoding — skip without doing any work.
-    if (gen !== playGen || turnId !== currentTurnId) continue;
-
-    const ctx = ensurePlayCtx();
-    let audioBuffer;
-    try {
-      audioBuffer = await ctx.decodeAudioData(mp3Bytes);
-    } catch (e) {
-      // A lone chunk slice isn't always independently decodable at MP3
-      // frame boundaries. Skip it — causes a tiny glitch, not silence.
-      console.warn("Chunk decode failed, skipping:", e);
-      continue;
-    }
-
-    // Re-check AFTER the await. Because chunks are drained sequentially,
-    // this is the only place staleness can be introduced mid-flight, and
-    // only one such check is ever pending at a time — no race possible.
-    if (gen !== playGen || turnId !== currentTurnId) continue;
-
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(masterGain);
-
-    const startAt = Math.max(nextStartTime, ctx.currentTime);
-    source.start(startAt);
-    nextStartTime = startAt + audioBuffer.duration;
-
-    activeSources.push(source);
-    source.onended = () => {
-      activeSources = activeSources.filter(s => s !== source);
-      if (activeSources.length === 0 && turnId === currentTurnId && gen === playGen) {
-        setOrbState("listening");
-        setStatus("Listening…", "active");
-      }
-    };
-  }
-  drainingQueue = false;
+  const turnId = view.getUint32(0, false);   // big-endian matches server ">II"
+  if (turnId !== currentTurnId) return;      // stale turn — drop immediately
+  scheduleChunk(buf, turnId, playGen);
 }
 
 function resetTtsPlaybackState() {
@@ -579,19 +460,19 @@ function resetTtsPlaybackState() {
   stopAllActiveSources();
   currentTurnId = -1;
   nextStartTime = 0;
-  turnMsgEl = null;
+  turnMsgEl     = null;
 }
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 async function openWebSocket() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const url   = `${proto}://${location.host}/ws`;
-  ws          = new WebSocket(url);
+ // ws           = new WebSocket(`${proto}://${location.host}/ws`);
+  ws           = new WebSocket(`${proto}://${location.host}/bmc/ws`);
   ws.binaryType = "arraybuffer";
 
   return new Promise((resolve, reject) => {
-    ws.onopen    = () => resolve();
-    ws.onerror   = (e) => reject(e);
+    ws.onopen  = () => resolve();
+    ws.onerror = (e) => reject(e);
 
     ws.onmessage = async (ev) => {
       if (ev.data instanceof ArrayBuffer) {
@@ -599,24 +480,11 @@ async function openWebSocket() {
         return;
       }
       const msg = JSON.parse(ev.data);
-
-      if (msg.type === "answer") {
-        const answer = new RTCSessionDescription({ type: msg.sdp_type, sdp: msg.sdp });
-        await pc.setRemoteDescription(answer);
-
-      } else if (msg.type === "transcript") {
-        const bubble = addMessage(msg.text, msg.speaker);
-        if (msg.speaker === "agent") turnMsgEl = bubble;
-
-      } else if (msg.type === "tts_start") {
-        onTtsStart(msg.turn_id);
-
-      } else if (msg.type === "tts_end") {
-        onTtsEnd(msg.turn_id);
-
-      } else if (msg.type === "interrupt") {
-        onInterrupt(msg.turn_id);
-      }
+      if      (msg.type === "answer")     { await pc.setRemoteDescription(new RTCSessionDescription({ type: msg.sdp_type, sdp: msg.sdp })); }
+      else if (msg.type === "transcript") { const b = addMessage(msg.text, msg.speaker); if (msg.speaker === "agent") turnMsgEl = b; }
+      else if (msg.type === "tts_start")  { onTtsStart(msg); }
+      else if (msg.type === "tts_end")    { onTtsEnd(msg.turn_id); }
+      else if (msg.type === "interrupt")  { onInterrupt(msg.turn_id); }
     };
 
     ws.onclose = () => {
@@ -627,7 +495,7 @@ async function openWebSocket() {
   });
 }
 
-// ─── WebRTC ────────────────────────────────────────────────────────────────────
+// ─── WebRTC ───────────────────────────────────────────────────────────────────
 async function startWebRTC(stream) {
   pc = new RTCPeerConnection({
     iceServers: [
@@ -639,16 +507,13 @@ async function startWebRTC(stream) {
   stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
 
   pc.onicecandidate = ({ candidate }) => {
-    if (candidate && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
-        type:      "ice_candidate",
-        candidate: candidate.toJSON(),
-      }));
+    if (candidate && ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "ice_candidate", candidate: candidate.toJSON() }));
     }
   };
 
   pc.onconnectionstatechange = () => {
-    console.log("WebRTC state:", pc.connectionState);
+    console.log("WebRTC:", pc.connectionState);
     if (pc.connectionState === "connected") {
       setStatus("Listening…", "active");
       setOrbState("listening");
@@ -670,13 +535,7 @@ async function startSession() {
 
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation:   true,
-        noiseSuppression:   true,
-        autoGainControl:    true,
-        channelCount:       1,
-        sampleRate:         16000,
-      },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 16000 },
       video: false
     });
   } catch(e) {
@@ -687,10 +546,7 @@ async function startSession() {
   }
 
   setStatus("Connecting…", "");
-
-  // Create/resume the playback AudioContext inside this click-triggered
-  // handler so browser autoplay policies don't block TTS later.
-  ensurePlayCtx();
+  ensurePlayCtx();   // create inside click gesture so autoplay is allowed
 
   try {
     await openWebSocket();
@@ -715,12 +571,12 @@ function resetUI() {
 
 async function stopSession() {
   stopBtn.disabled = true;
-  if (ws) { ws.send(JSON.stringify({ type: "close" })); ws.close(); ws = null; }
-  if (pc) { pc.close(); pc = null; }
+  if (ws)          { ws.send(JSON.stringify({ type: "close" })); ws.close(); ws = null; }
+  if (pc)          { pc.close(); pc = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   stopVolMeter();
   resetTtsPlaybackState();
-  if (playCtx) { playCtx.close(); playCtx = null; }
+  if (playCtx) { playCtx.close(); playCtx = null; masterGain = null; }
   setStatus("Session ended", "");
   setOrbState("idle");
   resetUI();
