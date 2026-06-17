@@ -1,39 +1,14 @@
 """
-WebRTC Voice Agent Server — Production-Ready + Noise Cancellation + Reliable Barge-in
-=======================================================================================
-Pure WebRTC signaling + Deepgram STT + OpenAI LLM + OpenAI TTS
-
-THIS VERSION'S KEY FIX vs the previous one
-────────────────────────────────────────────
-The server-side interrupt logic (_pipeline_lock scoping, _interrupt Event,
-clearing it only in `finally`, setting `_speaking` inside the semaphore) was
-already correct. The actual bug was on the CLIENT: TTS audio was buffered
-into one big Blob and only started playing once `tts_end` arrived, with no
-way for the client to know which `tts_start`/`tts_end`/audio-chunk sequence
-a given message belonged to. That meant a stale, already-superseded TTS
-turn could still start playing audio after the "interrupt" message had
-already been processed (a race between async `audio.play()` and the
-interrupt handler).
-
-The fix: every TTS turn now carries an explicit `turn_id`. The client
-keeps track of the "current" turn_id and ignores/aborts anything tagged
-with an older one — so even if messages or playback calls resolve out of
-order, stale audio can never start playing. The binary audio chunks
-themselves can't carry a JSON tag, so we frame each chunk with a tiny
-4-byte sequence header containing the turn ordinal, which is cheap and
-keeps chunks self-describing without needing a side-channel.
-
-Architecture:
-  Browser  <──WebRTC audio──>  aiortc server
-                                    │
-                 ┌──────────────────┼──────────────────┐
-                 ▼                  ▼                   ▼
-          WebRTC VAD          noisereduce          ProcessPool
-          (20 ms frames)      (per utterance)      (CPU work)
-                 │
-        ┌────────┼────────┐
-        ▼        ▼        ▼
-   Deepgram  OpenAI LLM  OpenAI TTS
+WebRTC Voice Agent Server — Cartesia TTS + Multi-User Fix
+==========================================================
+Changes from previous version:
+  1. TTS provider switched from OpenAI → Cartesia (cartesia-ai SDK)
+  2. Multi-user fix: _tts_sem moved from global to per-session, so one
+     user's slow TTS never blocks another user's pipeline.
+  3. _turn_seq, _speaking, _interrupt all remain per-session (were already
+     correct) — no change needed there.
+  4. .env: CARTESIA_API_KEY + CARTESIA_VOICE_ID + CARTESIA_MODEL are now
+     the TTS config keys. OPENAI TTS keys removed.
 """
 
 from __future__ import annotations
@@ -53,11 +28,6 @@ import aiofiles
 import aiohttp
 import numpy as np
 import noisereduce as nr
-# webrtcvad-wheels is a drop-in replacement for webrtcvad that works on
-# Python 3.12+ and 3.14+. The original webrtcvad==2.0.10 uses `pkg_resources`
-# which was removed in Python 3.14, causing ModuleNotFoundError on import.
-# Install with: pip install webrtcvad-wheels
-# API is identical — no other code changes needed.
 import webrtcvad
 from aiohttp import web
 from aiortc import (
@@ -71,6 +41,9 @@ from av.audio.resampler import AudioResampler
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+# Cartesia Python SDK  (pip install cartesia)
+from cartesia import AsyncCartesia
+
 load_dotenv(".env")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -81,45 +54,56 @@ logging.basicConfig(
 logger = logging.getLogger("webrtc_agent")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-LLM_MODEL        = os.getenv("LLM_CHOICE", "gpt-4.1-mini")
-COST_LOG_PATH    = os.getenv("COST_LOG_PATH", "session_costs.log")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+DEEPGRAM_API_KEY  = os.getenv("DEEPGRAM_API_KEY", "")
+CARTESIA_API_KEY  = os.getenv("CARTESIA_API_KEY", "")
+# Voice ID — find yours at https://play.cartesia.ai/voices
+# Default: "a0e99841-438c-4a64-b679-ae501e7d6091"  (Barbershop Man)
+CARTESIA_VOICE_ID = os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091")
+# Model: sonic-2 is Cartesia's latest (fastest + best quality)
+CARTESIA_MODEL    = os.getenv("CARTESIA_MODEL", "sonic-2")
+
+LLM_MODEL      = os.getenv("LLM_CHOICE", "gpt-4.1-mini")
+COST_LOG_PATH  = os.getenv("COST_LOG_PATH", "session_costs.log")
 
 MAX_SESSIONS        = int(os.getenv("MAX_SESSIONS",        "100"))
 MAX_SESSIONS_PER_IP = int(os.getenv("MAX_SESSIONS_PER_IP", "5"))
 STT_CONCURRENCY     = int(os.getenv("STT_CONCURRENCY",     "20"))
 LLM_CONCURRENCY     = int(os.getenv("LLM_CONCURRENCY",     "20"))
-TTS_CONCURRENCY     = int(os.getenv("TTS_CONCURRENCY",     "10"))
+# NOTE: TTS_CONCURRENCY is now a PER-SESSION limit (default 1 = one TTS
+# stream at a time per user, which is all you ever need). The old global
+# semaphore was the root cause of multi-user TTS blocking.
+TTS_CONCURRENCY_PER_SESSION = int(os.getenv("TTS_CONCURRENCY", "1"))
+
 MAX_HISTORY_TURNS   = int(os.getenv("MAX_HISTORY_TURNS",   "20"))
 MAX_AUDIO_BUF_SEC   = float(os.getenv("MAX_AUDIO_BUF_SEC", "30.0"))
 API_TIMEOUT_SEC     = float(os.getenv("API_TIMEOUT_SEC",   "10.0"))
 API_MAX_RETRIES     = int(os.getenv("API_MAX_RETRIES",     "3"))
 
-# ── VAD / barge-in tuning ─────────────────────────────────────────────────────
-VAD_AGGRESSIVENESS   = int(os.getenv("VAD_AGGRESSIVENESS",  "3"))
-VAD_SILENCE_FRAMES    = int(os.getenv("VAD_SILENCE_FRAMES",  "30"))   # 600 ms
-VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "12")) # 250 ms
-
-# ── Noise reduction ───────────────────────────────────────────────────────────
-NOISE_REDUCE_PROP = float(os.getenv("NOISE_REDUCE_PROP", "0.85"))
+VAD_AGGRESSIVENESS    = int(os.getenv("VAD_AGGRESSIVENESS",   "3"))
+VAD_SILENCE_FRAMES    = int(os.getenv("VAD_SILENCE_FRAMES",   "30"))
+VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES","12"))
+NOISE_REDUCE_PROP     = float(os.getenv("NOISE_REDUCE_PROP",  "0.85"))
 
 # ─── Pricing ──────────────────────────────────────────────────────────────────
 PRICING = {
     "stt_per_min":              0.0048,
     "llm_input_per_1m_tokens":  0.40,
     "llm_output_per_1m_tokens": 1.60,
-    "tts_per_1m_chars":         15.0,
+    # Cartesia sonic-2: $0.000 per character (check your plan)
+    # Update this if you're on a paid tier
+    "tts_per_1m_chars":         65.0,   # Cartesia standard rate
 }
 
-# ─── Global singletons (initialised in on_startup) ────────────────────────────
-openai_client: Optional[AsyncOpenAI]           = None
-http_session:  Optional[aiohttp.ClientSession] = None
-process_pool:  Optional[ProcessPoolExecutor]   = None
+# ─── Global singletons ────────────────────────────────────────────────────────
+openai_client:   Optional[AsyncOpenAI]     = None
+cartesia_client: Optional[AsyncCartesia]   = None
+http_session:    Optional[aiohttp.ClientSession] = None
+process_pool:    Optional[ProcessPoolExecutor]   = None
 
 _stt_sem: Optional[asyncio.Semaphore] = None
 _llm_sem: Optional[asyncio.Semaphore] = None
-_tts_sem: Optional[asyncio.Semaphore] = None
+# ✅ NO global _tts_sem — TTS semaphore is now per ConversationSession
 
 sessions:         dict[str, "ConversationSession"] = {}
 ip_session_count: dict[str, int]                   = {}
@@ -128,15 +112,18 @@ ip_session_count: dict[str, int]                   = {}
 # ─── App lifecycle ─────────────────────────────────────────────────────────────
 
 async def on_startup(app: web.Application) -> None:
-    global openai_client, http_session, process_pool
-    global _stt_sem, _llm_sem, _tts_sem
+    global openai_client, cartesia_client, http_session, process_pool
+    global _stt_sem, _llm_sem
 
     if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set — LLM and TTS calls will fail")
+        logger.warning("OPENAI_API_KEY not set — LLM calls will fail")
     if not DEEPGRAM_API_KEY:
-        logger.warning("DEEPGRAM_API_KEY is not set — STT calls will fail")
+        logger.warning("DEEPGRAM_API_KEY not set — STT calls will fail")
+    if not CARTESIA_API_KEY:
+        logger.warning("CARTESIA_API_KEY not set — TTS calls will fail")
 
-    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    openai_client   = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    cartesia_client = AsyncCartesia(api_key=CARTESIA_API_KEY)
 
     connector    = aiohttp.TCPConnector(limit=64, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
@@ -145,22 +132,22 @@ async def on_startup(app: web.Application) -> None:
 
     _stt_sem = asyncio.Semaphore(STT_CONCURRENCY)
     _llm_sem = asyncio.Semaphore(LLM_CONCURRENCY)
-    _tts_sem = asyncio.Semaphore(TTS_CONCURRENCY)
 
     logger.info(
         f"Server started | max_sessions={MAX_SESSIONS} "
-        f"vad_aggressiveness={VAD_AGGRESSIVENESS} "
-        f"vad_silence_frames={VAD_SILENCE_FRAMES} "
-        f"noise_reduce_prop={NOISE_REDUCE_PROP}"
+        f"cartesia_model={CARTESIA_MODEL} voice={CARTESIA_VOICE_ID} "
+        f"vad_aggressiveness={VAD_AGGRESSIVENESS}"
     )
 
 
 async def on_shutdown(app: web.Application) -> None:
-    logger.info("Graceful shutdown: closing all sessions …")
+    logger.info("Graceful shutdown …")
     close_tasks = [s.close() for s in list(sessions.values())]
     if close_tasks:
         await asyncio.gather(*close_tasks, return_exceptions=True)
 
+    if cartesia_client:
+        await cartesia_client.close()
     if http_session:
         await http_session.close()
     if process_pool:
@@ -185,7 +172,10 @@ class SessionCostTracker:
 
     def add_stt(self, seconds: float):     self.stt_audio_sec     += seconds
     def add_tts(self, chars: int):         self.tts_chars         += chars
-    def add_llm(self, inp: int, out: int): self.llm_input_tokens  += inp; self.llm_output_tokens += out; self.turns += 1
+    def add_llm(self, inp: int, out: int):
+        self.llm_input_tokens  += inp
+        self.llm_output_tokens += out
+        self.turns             += 1
 
     async def flush(self) -> None:
         if self._flushed:
@@ -230,50 +220,38 @@ class SessionCostTracker:
 
 def _noise_reduce_sync(pcm_bytes: bytes, sample_rate: int, prop_decrease: float) -> bytes:
     arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-    if len(arr) < sample_rate // 10:          # < 100 ms — too short, skip
+    if len(arr) < sample_rate // 10:
         return pcm_bytes
     reduced = nr.reduce_noise(
-        y=arr,
-        sr=sample_rate,
-        stationary=True,
-        prop_decrease=prop_decrease,
-        n_jobs=1,
+        y=arr, sr=sample_rate, stationary=True,
+        prop_decrease=prop_decrease, n_jobs=1,
     )
     out = np.clip(reduced * 32768.0, -32768, 32767).astype(np.int16)
     return out.tobytes()
 
 
-# ─── MicrophoneTrackSink with WebRTC VAD ─────────────────────────────────────
+# ─── MicrophoneTrackSink ──────────────────────────────────────────────────────
 
 class MicrophoneTrackSink:
     SAMPLE_RATE   = 16_000
     FRAME_MS      = 20
-    FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 320 samples = 640 bytes
+    FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 
     def __init__(self, session_id: str, on_utterance, on_speech_confirmed=None):
-        self._session_id  = session_id
-        self._on_utterance = on_utterance
-        # Fired exactly once per utterance, the moment VAD_MIN_SPEECH_FRAMES
-        # of CONSECUTIVE confirmed speech is reached — i.e. well before the
-        # user finishes talking. This is what lets the server cut TTS the
-        # instant the user starts a real sentence, instead of waiting for
-        # them to finish and for trailing silence to elapse (which is what
-        # _on_utterance waits for). A brief noise pop never reaches this
-        # threshold's consecutive-frame requirement, so it's still immune
-        # to random background noise — same guarantee as before, just
-        # signaled earlier.
+        self._session_id          = session_id
+        self._on_utterance        = on_utterance
         self._on_speech_confirmed = on_speech_confirmed
 
-        self._resampler = AudioResampler(format="s16", layout="mono", rate=self.SAMPLE_RATE)
-        self._vad       = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        self._resampler  = AudioResampler(format="s16", layout="mono", rate=self.SAMPLE_RATE)
+        self._vad        = webrtcvad.Vad(VAD_AGGRESSIVENESS)
         self._ring: bytes = b""
 
         self._utt_frames: list[bytes] = []
         self._speech_frames  = 0
         self._silence_frames = 0
         self._in_utterance   = False
-        self._confirmed_sent = False   # guards on_speech_confirmed to fire once per utterance
-        self._utt_sec    = 0.0
+        self._confirmed_sent = False
+        self._utt_sec        = 0.0
         self._task: Optional[asyncio.Task] = None
 
     def receive(self, track: MediaStreamTrack) -> None:
@@ -298,12 +276,10 @@ class MicrophoneTrackSink:
                 frame: AudioFrame = await track.recv()
                 pcm = self._to_mono16k(frame)
                 self._ring += pcm
-
                 while len(self._ring) >= self.FRAME_SAMPLES * 2:
-                    frame_bytes = self._ring[: self.FRAME_SAMPLES * 2]
-                    self._ring  = self._ring[self.FRAME_SAMPLES * 2 :]
+                    frame_bytes  = self._ring[: self.FRAME_SAMPLES * 2]
+                    self._ring   = self._ring[self.FRAME_SAMPLES * 2 :]
                     await self._process_frame(frame_bytes, loop)
-
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -317,10 +293,10 @@ class MicrophoneTrackSink:
 
         if is_speech:
             if not self._in_utterance:
-                self._in_utterance  = True
-                self._utt_frames    = []
-                self._utt_sec       = 0.0
-                self._speech_frames = 0
+                self._in_utterance   = True
+                self._utt_frames     = []
+                self._utt_sec        = 0.0
+                self._speech_frames  = 0
                 self._confirmed_sent = False
                 logger.info(f"[{self._session_id}] 🎙 Speech start (VAD)")
 
@@ -329,10 +305,6 @@ class MicrophoneTrackSink:
             self._speech_frames += 1
             self._silence_frames = 0
 
-            # Fire the early "this is real speech, not noise" signal the
-            # moment we cross the confirmation threshold — same threshold
-            # used to decide whether to keep the utterance at all, so the
-            # noise-immunity guarantee is identical, just earlier.
             if (
                 not self._confirmed_sent
                 and self._speech_frames >= VAD_MIN_SPEECH_FRAMES
@@ -342,25 +314,20 @@ class MicrophoneTrackSink:
                 await self._on_speech_confirmed()
 
             if self._utt_sec >= MAX_AUDIO_BUF_SEC:
-                logger.warning(f"[{self._session_id}] Max utterance length hit — force-flushing")
+                logger.warning(f"[{self._session_id}] Max utterance length — force-flushing")
                 await self._flush(loop)
-
         else:
             if self._in_utterance:
                 self._utt_frames.append(frame_bytes)
                 self._utt_sec        += self.FRAME_MS / 1000
                 self._silence_frames += 1
-
                 if self._silence_frames >= VAD_SILENCE_FRAMES:
                     await self._flush(loop)
 
     async def _flush(self, loop: asyncio.AbstractEventLoop) -> None:
         if not self._utt_frames or self._speech_frames < VAD_MIN_SPEECH_FRAMES:
             if self._utt_frames:
-                logger.debug(
-                    f"[{self._session_id}] Discarding short utterance "
-                    f"({self._speech_frames} speech frames < min {VAD_MIN_SPEECH_FRAMES})"
-                )
+                logger.debug(f"[{self._session_id}] Discarding short utterance")
             self._reset_utterance()
             return
 
@@ -368,14 +335,13 @@ class MicrophoneTrackSink:
         duration = self._utt_sec
         self._reset_utterance()
 
-        logger.info(f"[{self._session_id}] 🎙 Utterance end — {duration:.2f}s, running noise reduction")
-
+        logger.info(f"[{self._session_id}] 🎙 Utterance end — {duration:.2f}s, noise-reducing")
         try:
             clean_pcm: bytes = await loop.run_in_executor(
                 process_pool, _noise_reduce_sync, raw_pcm, self.SAMPLE_RATE, NOISE_REDUCE_PROP,
             )
         except Exception as exc:
-            logger.warning(f"[{self._session_id}] Noise reduction failed, using raw audio: {exc}")
+            logger.warning(f"[{self._session_id}] Noise reduction failed: {exc}")
             clean_pcm = raw_pcm
 
         await self._on_utterance(clean_pcm, duration)
@@ -422,16 +388,12 @@ async def transcribe_audio(session_id: str, audio_bytes: bytes) -> str:
                     if resp.status != 200:
                         logger.error(f"[{session_id}] Deepgram {resp.status}: {await resp.text()}")
                         return ""
-                    data = await resp.json()
+                    data     = await resp.json()
                     channels = data.get("results", {}).get("channels", [])
                     if channels:
                         alts = channels[0].get("alternatives", [])
                         if alts:
-                            transcript = alts[0].get("transcript", "").strip()
-                            if not transcript:
-                                logger.debug(f"[{session_id}] Deepgram: empty transcript")
-                            return transcript
-                    logger.warning(f"[{session_id}] Deepgram: no channels in response")
+                            return alts[0].get("transcript", "").strip()
                     return ""
             except asyncio.TimeoutError:
                 logger.warning(f"[{session_id}] Deepgram timeout (attempt {attempt})")
@@ -443,7 +405,7 @@ async def transcribe_audio(session_id: str, audio_bytes: bytes) -> str:
     return ""
 
 
-# ─── Conversation session ─────────────────────────────────────────────────────
+# ─── Conversation Session ─────────────────────────────────────────────────────
 
 class ConversationSession:
     SYSTEM_PROMPT = (
@@ -460,17 +422,16 @@ class ConversationSession:
         self._history:  list[dict] = []
         self._cost       = SessionCostTracker(session_id)
 
-        self._speaking      = False
-        self._interrupt     = asyncio.Event()
-
-        # Monotonically increasing turn counter. Every TTS utterance gets the
-        # NEXT value. This is sent in tts_start / tts_end / each audio frame
-        # header so the client can always tell which turn a message belongs
-        # to and discard anything that isn't the current one — even if
-        # messages race or resolve out of order on the client.
-        self._turn_seq = 0
+        self._speaking   = False
+        self._interrupt  = asyncio.Event()
+        self._turn_seq   = 0
 
         self._pipeline_lock = asyncio.Lock()
+
+        # ✅ Per-session TTS semaphore — completely isolated from other users.
+        # Value of 1 means one TTS stream at a time per user (correct),
+        # but doesn't starve other users the way the old global semaphore did.
+        self._tts_sem = asyncio.Semaphore(TTS_CONCURRENCY_PER_SESSION)
 
         self._pc:   Optional[RTCPeerConnection]   = None
         self._sink: Optional[MicrophoneTrackSink] = None
@@ -523,23 +484,6 @@ class ConversationSession:
         await self._speak_and_send("Hello! I'm your voice assistant. How can I help you today?")
 
     async def _on_speech_confirmed(self) -> None:
-        """
-        Fires the moment VAD has seen VAD_MIN_SPEECH_FRAMES (250ms) of
-        CONSECUTIVE confirmed speech — i.e. as soon as the user has clearly
-        started talking, not after they finish. This is what makes barge-in
-        feel instant instead of laggy: previously the interrupt only fired
-        from _on_utterance, which waits for the full utterance INCLUDING
-        VAD_SILENCE_FRAMES (600ms) of trailing silence after the user stops
-        talking — meaning TTS kept overlapping with the user's entire
-        sentence before ever being told to stop.
-
-        Noise immunity is unchanged: this uses the exact same
-        VAD_MIN_SPEECH_FRAMES threshold that _flush() uses to decide whether
-        an utterance is real speech at all, just checked earlier (the
-        moment the threshold is crossed, instead of at utterance end). A
-        single noise pop still can't reach this threshold's *consecutive*
-        frame requirement.
-        """
         if self._speaking:
             logger.info(f"[{self._session_id}] 🛑 Barge-in confirmed — interrupting TTS")
             self._interrupt.set()
@@ -547,18 +491,12 @@ class ConversationSession:
             await asyncio.sleep(0)
 
     async def _on_utterance(self, audio: bytes, duration_sec: float) -> None:
-        # By the time we get here, _on_speech_confirmed has already fired
-        # (if this was a barge-in) — TTS was stopped ~600ms+ earlier, as
-        # soon as speech was confirmed, rather than only now. If _speaking
-        # is somehow still true here (e.g. a new TTS turn started in the
-        # gap), this is a safety-net catch, not the primary mechanism.
         if self._speaking:
-            logger.info(f"[{self._session_id}] 🛑 Barge-in — interrupting TTS (end-of-utterance catch)")
+            logger.info(f"[{self._session_id}] 🛑 Barge-in (end-of-utterance safety catch)")
             self._interrupt.set()
             await self._ws.send_json({"type": "interrupt", "turn_id": self._turn_seq})
             await asyncio.sleep(0)
 
-        # ── STT + LLM under lock (no two turns overlap) ──────────────────
         async with self._pipeline_lock:
             self._cost.add_stt(duration_sec)
 
@@ -575,7 +513,6 @@ class ConversationSession:
 
             response = await self._llm_respond(transcript)
 
-        # ── TTS outside the lock — barge-in never blocked here ───────────
         if response:
             await self._speak_and_send(response)
 
@@ -595,9 +532,9 @@ class ConversationSession:
                         ),
                         timeout=API_TIMEOUT_SEC,
                     )
-                    text       = resp.choices[0].message.content.strip()
-                    in_tok     = resp.usage.prompt_tokens
-                    out_tok    = resp.usage.completion_tokens
+                    text    = resp.choices[0].message.content.strip()
+                    in_tok  = resp.usage.prompt_tokens
+                    out_tok = resp.usage.completion_tokens
                     self._cost.add_llm(in_tok, out_tok)
                     self._history.append({"role": "assistant", "content": text})
                     logger.info(f"[{self._session_id}] 🤖 Agent: {text}")
@@ -616,21 +553,17 @@ class ConversationSession:
             self._history.pop()
         return "Sorry, I had a bit of trouble there. Could you try again?"
 
+    # ── Cartesia TTS ──────────────────────────────────────────────────────────
+
     async def _speak_and_send(self, text: str) -> None:
         self._cost.add_tts(len(text))
 
-        # Claim this turn's id BEFORE acquiring the semaphore. That way even
-        # a turn that's still waiting for a concurrency slot has an id the
-        # client can later recognize as superseded if a newer turn starts.
         self._turn_seq += 1
         turn_id = self._turn_seq
 
-        async with _tts_sem:
-            # If we were superseded while waiting for the semaphore slot,
-            # don't even start — saves an OpenAI TTS call for audio nobody
-            # will hear.
+        async with self._tts_sem:   # ← now per-session, not global
             if turn_id != self._turn_seq:
-                logger.debug(f"[{self._session_id}] Turn {turn_id} superseded before TTS call — skipping")
+                logger.debug(f"[{self._session_id}] Turn {turn_id} superseded — skipping TTS")
                 return
 
             self._speaking = True
@@ -639,46 +572,56 @@ class ConversationSession:
 
                 for attempt in range(1, API_MAX_RETRIES + 1):
                     if self._interrupt.is_set() or turn_id != self._turn_seq:
-                        logger.debug(f"[{self._session_id}] TTS turn {turn_id} aborted before attempt {attempt}")
+                        logger.debug(f"[{self._session_id}] TTS turn {turn_id} aborted")
                         return
 
                     try:
                         seq_in_turn = 0
-                        async with openai_client.audio.speech.with_streaming_response.create(
-                            model="tts-1",
-                            voice="echo",
-                            input=text,
-                            response_format="mp3",
-                            speed=1.0,
-                        ) as tts_resp:
-                            async for chunk in tts_resp.iter_bytes(chunk_size=4096):
-                                if self._interrupt.is_set() or turn_id != self._turn_seq:
-                                    logger.debug(f"[{self._session_id}] TTS turn {turn_id} interrupted mid-stream")
-                                    return
-                                # Frame each binary chunk with an 8-byte header:
-                                # [turn_id: uint32][seq_in_turn: uint32], both
-                                # big-endian, so the client can always tell
-                                # which turn (and ordering) a chunk belongs to
-                                # without a separate JSON side-channel.
-                                header = struct.pack(">II", turn_id, seq_in_turn)
-                                seq_in_turn += 1
-                                await self._ws.send_bytes(header + chunk)
-                        break
+
+                        # Cartesia streaming TTS
+                        # output_format: raw PCM → mp3 is fine for browser
+                        # container="raw" + encoding="mp3" → streaming MP3 bytes
+                        async for chunk in await cartesia_client.tts.sse(
+                            model_id=CARTESIA_MODEL,
+                            transcript=text,
+                            voice={"id": CARTESIA_VOICE_ID},
+                            output_format={
+                                "container": "raw",
+                                "encoding":  "mp3",
+                                "sample_rate": 44100,
+                            },
+                            stream=True,
+                        ):
+                            if self._interrupt.is_set() or turn_id != self._turn_seq:
+                                logger.debug(
+                                    f"[{self._session_id}] TTS turn {turn_id} interrupted mid-stream"
+                                )
+                                return
+
+                            audio_bytes: bytes = chunk.get("audio", b"")
+                            if not audio_bytes:
+                                continue
+
+                            # Same 8-byte framing as before:
+                            # [turn_id: uint32][seq_in_turn: uint32] big-endian
+                            header = struct.pack(">II", turn_id, seq_in_turn)
+                            seq_in_turn += 1
+                            await self._ws.send_bytes(header + audio_bytes)
+
+                        break   # stream finished normally
+
                     except asyncio.TimeoutError:
-                        logger.warning(f"[{self._session_id}] TTS timeout (attempt {attempt})")
+                        logger.warning(f"[{self._session_id}] Cartesia timeout (attempt {attempt})")
                         if attempt == API_MAX_RETRIES:
                             break
                         await asyncio.sleep(2 ** attempt)
                     except Exception as exc:
-                        logger.error(f"[{self._session_id}] TTS error: {exc}", exc_info=exc)
+                        logger.error(f"[{self._session_id}] Cartesia TTS error: {exc}", exc_info=exc)
                         break
+
             finally:
                 self._speaking = False
                 self._interrupt.clear()
-                # Only tell the client this turn ended if it's still current.
-                # If we were superseded, the new turn's tts_start already
-                # told the client to move on — sending a stale tts_end here
-                # would needlessly confuse turn bookkeeping client-side.
                 if turn_id == self._turn_seq:
                     await self._ws.send_json({"type": "tts_end", "turn_id": turn_id})
 
@@ -698,11 +641,8 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     peer_ip = request.remote or "unknown"
 
     if len(sessions) >= MAX_SESSIONS:
-        logger.warning(f"Session cap reached — rejecting {peer_ip}")
         raise web.HTTPServiceUnavailable(reason="Server at capacity")
-
     if ip_session_count.get(peer_ip, 0) >= MAX_SESSIONS_PER_IP:
-        logger.warning(f"Per-IP cap reached for {peer_ip}")
         raise web.HTTPTooManyRequests(reason="Too many connections from your IP")
 
     ws = web.WebSocketResponse()
@@ -722,7 +662,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    data  = json.loads(msg.data)
+                    data = json.loads(msg.data)
                 except json.JSONDecodeError:
                     logger.warning(f"[{session_id}] Malformed JSON — ignoring")
                     continue
@@ -761,7 +701,6 @@ def _add_ice_candidate(session_id: str, pc: RTCPeerConnection, cand: dict) -> No
                 return
             parts = raw.split()
             if len(parts) < 8:
-                logger.debug(f"[{session_id}] Short ICE candidate — skipping")
                 return
             ice = RTCIceCandidate(
                 component     = int(parts[1]),
@@ -794,7 +733,11 @@ async def handle_index(request: web.Request) -> web.Response:
 
 async def handle_health(request: web.Request) -> web.Response:
     return web.Response(
-        text=json.dumps({"status": "ok", "sessions": len(sessions), "max_sessions": MAX_SESSIONS}),
+        text=json.dumps({
+            "status": "ok",
+            "sessions": len(sessions),
+            "max_sessions": MAX_SESSIONS,
+        }),
         content_type="application/json",
     )
 
@@ -805,9 +748,9 @@ def build_app() -> web.Application:
     app = web.Application()
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    app.router.add_get("/",        handle_index)
-    app.router.add_get("/ws",      handle_ws)
-    app.router.add_get("/health",  handle_health)
+    app.router.add_get("/",       handle_index)
+    app.router.add_get("/ws",     handle_ws)
+    app.router.add_get("/health", handle_health)
     app.router.add_static(
         "/static",
         os.path.join(os.path.dirname(__file__), "static"),
