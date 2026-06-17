@@ -311,8 +311,8 @@ function stopVolMeter() {
 // ─── WebSocket (signaling + JSON control messages only — no binary audio) ─────
 async function openWebSocket() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  // ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws = new WebSocket(`${proto}://${location.host}/bmc/ws`);
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // ws = new WebSocket(`${proto}://${location.host}/bmc/ws`);
 
   return new Promise((resolve, reject) => {
     ws.onopen  = () => resolve();
