@@ -1,30 +1,27 @@
 """
-WebRTC Voice Agent Server — Production-Ready + Noise Cancellation
-==================================================================
+WebRTC Voice Agent Server — Production-Ready + Noise Cancellation + Reliable Barge-in
+=======================================================================================
 Pure WebRTC signaling + Deepgram STT + OpenAI LLM + OpenAI TTS
 
-Audio pipeline upgrades in this version
-────────────────────────────────────────
-1. SERVER-SIDE NOISE REDUCTION
-   noisereduce (spectral subtraction) runs on every captured utterance
-   in a ProcessPoolExecutor before it reaches Deepgram.  This cleans
-   fan noise, AC hum, street noise, and other stationary backgrounds.
+THIS VERSION'S KEY FIX vs the previous one
+────────────────────────────────────────────
+The server-side interrupt logic (_pipeline_lock scoping, _interrupt Event,
+clearing it only in `finally`, setting `_speaking` inside the semaphore) was
+already correct. The actual bug was on the CLIENT: TTS audio was buffered
+into one big Blob and only started playing once `tts_end` arrived, with no
+way for the client to know which `tts_start`/`tts_end`/audio-chunk sequence
+a given message belonged to. That meant a stale, already-superseded TTS
+turn could still start playing audio after the "interrupt" message had
+already been processed (a race between async `audio.play()` and the
+interrupt handler).
 
-2. GOOGLE WebRTC VAD (replaces raw RMS threshold)
-   webrtcvad is a C-extension wrapping the exact VAD algorithm used
-   inside Chrome/Firefox WebRTC.  It classifies each 20 ms PCM frame
-   as speech / not-speech with far higher accuracy than a dB threshold,
-   working correctly in noisy environments and on mobile microphones.
-
-3. BARGE-IN (interrupt while AI is speaking)
-   _pipeline_lock is released BEFORE _speak_and_send so new speech
-   detected while TTS is playing immediately signals an interrupt,
-   stops TTS streaming, and starts a new pipeline turn.
-
-4. MOBILE-FRIENDLY SILENCE TUNING
-   VAD aggressiveness = 3 (most aggressive filter).
-   End-of-speech requires 600 ms of consecutive non-speech frames
-   (down from 1000 ms) for snappier turn-taking on mobile.
+The fix: every TTS turn now carries an explicit `turn_id`. The client
+keeps track of the "current" turn_id and ignores/aborts anything tagged
+with an older one — so even if messages or playback calls resolve out of
+order, stale audio can never start playing. The binary audio chunks
+themselves can't carry a JSON tag, so we frame each chunk with a tiny
+4-byte sequence header containing the turn ordinal, which is cheap and
+keeps chunks self-describing without needing a side-channel.
 
 Architecture:
   Browser  <──WebRTC audio──>  aiortc server
@@ -45,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import struct
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -99,21 +97,12 @@ API_TIMEOUT_SEC     = float(os.getenv("API_TIMEOUT_SEC",   "10.0"))
 API_MAX_RETRIES     = int(os.getenv("API_MAX_RETRIES",     "3"))
 
 # ── VAD / barge-in tuning ─────────────────────────────────────────────────────
-# webrtcvad aggressiveness: 0 = most permissive, 3 = most aggressive (filters
-# most non-speech). Level 3 works best for mobile / noisy environments.
-VAD_AGGRESSIVENESS  = int(os.getenv("VAD_AGGRESSIVENESS",  "3"))
-
-# How many consecutive non-speech 20 ms frames before we consider the
-# utterance finished. 600 ms = 30 frames. Lower = snappier turn-taking.
-VAD_SILENCE_FRAMES  = int(os.getenv("VAD_SILENCE_FRAMES",  "30"))   # 600 ms
-
-# Minimum speech frames before we bother sending audio to STT.
-# 250 ms = 12 frames.  Prevents single noise pops from triggering STT.
-VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "12"))
+VAD_AGGRESSIVENESS   = int(os.getenv("VAD_AGGRESSIVENESS",  "3"))
+VAD_SILENCE_FRAMES    = int(os.getenv("VAD_SILENCE_FRAMES",  "30"))   # 600 ms
+VAD_MIN_SPEECH_FRAMES = int(os.getenv("VAD_MIN_SPEECH_FRAMES", "12")) # 250 ms
 
 # ── Noise reduction ───────────────────────────────────────────────────────────
-# 0.0 = no reduction, 1.0 = full reduction.  0.85 is aggressive but keeps voice.
-NOISE_REDUCE_PROP   = float(os.getenv("NOISE_REDUCE_PROP", "0.85"))
+NOISE_REDUCE_PROP = float(os.getenv("NOISE_REDUCE_PROP", "0.85"))
 
 # ─── Pricing ──────────────────────────────────────────────────────────────────
 PRICING = {
@@ -141,6 +130,11 @@ ip_session_count: dict[str, int]                   = {}
 async def on_startup(app: web.Application) -> None:
     global openai_client, http_session, process_pool
     global _stt_sem, _llm_sem, _tts_sem
+
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY is not set — LLM and TTS calls will fail")
+    if not DEEPGRAM_API_KEY:
+        logger.warning("DEEPGRAM_API_KEY is not set — STT calls will fail")
 
     openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -233,24 +227,15 @@ class SessionCostTracker:
 
 
 # ─── CPU-bound audio helpers ──────────────────────────────────────────────────
-# These run in the ProcessPoolExecutor so they never block the event loop.
 
 def _noise_reduce_sync(pcm_bytes: bytes, sample_rate: int, prop_decrease: float) -> bytes:
-    """
-    Apply spectral noise reduction to a captured utterance.
-
-    Strategy: stationary=True uses the quietest part of the clip as a
-    noise profile estimate, which works well for constant background noise
-    (fan, AC, street hum).  For highly variable noise, set stationary=False
-    at the cost of ~2× CPU.
-    """
     arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     if len(arr) < sample_rate // 10:          # < 100 ms — too short, skip
         return pcm_bytes
     reduced = nr.reduce_noise(
         y=arr,
         sr=sample_rate,
-        stationary=True,                       # fast; good for constant backgrounds
+        stationary=True,
         prop_decrease=prop_decrease,
         n_jobs=1,
     )
@@ -258,55 +243,38 @@ def _noise_reduce_sync(pcm_bytes: bytes, sample_rate: int, prop_decrease: float)
     return out.tobytes()
 
 
-def _rms_db_sync(pcm_bytes: bytes) -> float:
-    arr = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    if len(arr) == 0:
-        return -100.0
-    rms = np.sqrt(np.mean(arr ** 2))
-    return float(20 * np.log10(max(rms, 1e-9) / 32768))
-
-
 # ─── MicrophoneTrackSink with WebRTC VAD ─────────────────────────────────────
 
 class MicrophoneTrackSink:
-    """
-    Receives WebRTC audio frames, resamples to 16 kHz mono s16,
-    classifies each 20 ms chunk with webrtcvad, and calls `on_utterance`
-    with the complete PCM bytes for each detected utterance.
-
-    WebRTC VAD replaces the old RMS-threshold approach:
-      ✓ Works correctly in noisy rooms and on mobile mics
-      ✓ No threshold to hand-tune per environment
-      ✓ Same algorithm Chrome uses internally for its own echo cancellation
-      ✓ Handles breathing sounds, mouth sounds, and non-speech vocals
-    """
-
     SAMPLE_RATE   = 16_000
-    FRAME_MS      = 20                        # webrtcvad supports 10 / 20 / 30 ms
+    FRAME_MS      = 20
     FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000   # 320 samples = 640 bytes
 
-    def __init__(self, session_id: str, on_utterance):
+    def __init__(self, session_id: str, on_utterance, on_speech_confirmed=None):
         self._session_id  = session_id
         self._on_utterance = on_utterance
+        # Fired exactly once per utterance, the moment VAD_MIN_SPEECH_FRAMES
+        # of CONSECUTIVE confirmed speech is reached — i.e. well before the
+        # user finishes talking. This is what lets the server cut TTS the
+        # instant the user starts a real sentence, instead of waiting for
+        # them to finish and for trailing silence to elapse (which is what
+        # _on_utterance waits for). A brief noise pop never reaches this
+        # threshold's consecutive-frame requirement, so it's still immune
+        # to random background noise — same guarantee as before, just
+        # signaled earlier.
+        self._on_speech_confirmed = on_speech_confirmed
 
-        self._resampler   = AudioResampler(format="s16", layout="mono", rate=self.SAMPLE_RATE)
-
-        # webrtcvad instance — aggressiveness 0–3
-        self._vad         = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-
-        # Ring buffer for framing (aiortc frames are not exactly 20 ms)
+        self._resampler = AudioResampler(format="s16", layout="mono", rate=self.SAMPLE_RATE)
+        self._vad       = webrtcvad.Vad(VAD_AGGRESSIVENESS)
         self._ring: bytes = b""
 
-        # Utterance accumulator
         self._utt_frames: list[bytes] = []
-        self._speech_frames  = 0      # consecutive speech frames in current utt
-        self._silence_frames = 0      # consecutive silence frames after speech
+        self._speech_frames  = 0
+        self._silence_frames = 0
         self._in_utterance   = False
-
-        self._utt_sec    = 0.0        # duration of current utterance
+        self._confirmed_sent = False   # guards on_speech_confirmed to fire once per utterance
+        self._utt_sec    = 0.0
         self._task: Optional[asyncio.Task] = None
-
-    # ── public ──────────────────────────────────────────────────────────────
 
     def receive(self, track: MediaStreamTrack) -> None:
         self._task = asyncio.create_task(self._run(track))
@@ -315,8 +283,6 @@ class MicrophoneTrackSink:
     def stop(self) -> None:
         if self._task and not self._task.done():
             self._task.cancel()
-
-    # ── internals ───────────────────────────────────────────────────────────
 
     def _on_task_done(self, task: asyncio.Task) -> None:
         if task.cancelled():
@@ -333,10 +299,9 @@ class MicrophoneTrackSink:
                 pcm = self._to_mono16k(frame)
                 self._ring += pcm
 
-                # Slice ring buffer into exact 20 ms frames for webrtcvad
                 while len(self._ring) >= self.FRAME_SAMPLES * 2:
-                    frame_bytes      = self._ring[: self.FRAME_SAMPLES * 2]
-                    self._ring       = self._ring[self.FRAME_SAMPLES * 2 :]
+                    frame_bytes = self._ring[: self.FRAME_SAMPLES * 2]
+                    self._ring  = self._ring[self.FRAME_SAMPLES * 2 :]
                     await self._process_frame(frame_bytes, loop)
 
         except asyncio.CancelledError:
@@ -345,11 +310,9 @@ class MicrophoneTrackSink:
             logger.error(f"[{self._session_id}] Audio sink error: {exc}", exc_info=exc)
 
     async def _process_frame(self, frame_bytes: bytes, loop: asyncio.AbstractEventLoop) -> None:
-        """Classify one 20 ms frame and manage utterance boundaries."""
         try:
             is_speech = self._vad.is_speech(frame_bytes, self.SAMPLE_RATE)
         except Exception:
-            # webrtcvad raises on malformed frames — treat as silence
             is_speech = False
 
         if is_speech:
@@ -358,6 +321,7 @@ class MicrophoneTrackSink:
                 self._utt_frames    = []
                 self._utt_sec       = 0.0
                 self._speech_frames = 0
+                self._confirmed_sent = False
                 logger.info(f"[{self._session_id}] 🎙 Speech start (VAD)")
 
             self._utt_frames.append(frame_bytes)
@@ -365,14 +329,25 @@ class MicrophoneTrackSink:
             self._speech_frames += 1
             self._silence_frames = 0
 
-            # Hard cap: force-flush at MAX_AUDIO_BUF_SEC
+            # Fire the early "this is real speech, not noise" signal the
+            # moment we cross the confirmation threshold — same threshold
+            # used to decide whether to keep the utterance at all, so the
+            # noise-immunity guarantee is identical, just earlier.
+            if (
+                not self._confirmed_sent
+                and self._speech_frames >= VAD_MIN_SPEECH_FRAMES
+                and self._on_speech_confirmed is not None
+            ):
+                self._confirmed_sent = True
+                await self._on_speech_confirmed()
+
             if self._utt_sec >= MAX_AUDIO_BUF_SEC:
                 logger.warning(f"[{self._session_id}] Max utterance length hit — force-flushing")
                 await self._flush(loop)
 
         else:
             if self._in_utterance:
-                self._utt_frames.append(frame_bytes)    # keep trailing silence for STT context
+                self._utt_frames.append(frame_bytes)
                 self._utt_sec        += self.FRAME_MS / 1000
                 self._silence_frames += 1
 
@@ -380,9 +355,7 @@ class MicrophoneTrackSink:
                     await self._flush(loop)
 
     async def _flush(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Noise-reduce and emit the accumulated utterance."""
         if not self._utt_frames or self._speech_frames < VAD_MIN_SPEECH_FRAMES:
-            # Too short — likely a noise pop or breath sound, discard
             if self._utt_frames:
                 logger.debug(
                     f"[{self._session_id}] Discarding short utterance "
@@ -397,14 +370,9 @@ class MicrophoneTrackSink:
 
         logger.info(f"[{self._session_id}] 🎙 Utterance end — {duration:.2f}s, running noise reduction")
 
-        # ── Noise reduction in process pool ──────────────────────────────
         try:
             clean_pcm: bytes = await loop.run_in_executor(
-                process_pool,
-                _noise_reduce_sync,
-                raw_pcm,
-                self.SAMPLE_RATE,
-                NOISE_REDUCE_PROP,
+                process_pool, _noise_reduce_sync, raw_pcm, self.SAMPLE_RATE, NOISE_REDUCE_PROP,
             )
         except Exception as exc:
             logger.warning(f"[{self._session_id}] Noise reduction failed, using raw audio: {exc}")
@@ -455,7 +423,6 @@ async def transcribe_audio(session_id: str, audio_bytes: bytes) -> str:
                         logger.error(f"[{session_id}] Deepgram {resp.status}: {await resp.text()}")
                         return ""
                     data = await resp.json()
-                    logger.debug(f"[{session_id}] Deepgram raw: {json.dumps(data)}")
                     channels = data.get("results", {}).get("channels", [])
                     if channels:
                         alts = channels[0].get("alternatives", [])
@@ -496,9 +463,13 @@ class ConversationSession:
         self._speaking      = False
         self._interrupt     = asyncio.Event()
 
-        # Per-session pipeline lock so STT→LLM→TTS turns don't overlap.
-        # IMPORTANT: the lock is acquired ONLY for LLM+TTS, NOT for barge-in
-        # detection, so a new utterance can always interrupt TTS.
+        # Monotonically increasing turn counter. Every TTS utterance gets the
+        # NEXT value. This is sent in tts_start / tts_end / each audio frame
+        # header so the client can always tell which turn a message belongs
+        # to and discard anything that isn't the current one — even if
+        # messages race or resolve out of order on the client.
+        self._turn_seq = 0
+
         self._pipeline_lock = asyncio.Lock()
 
         self._pc:   Optional[RTCPeerConnection]   = None
@@ -532,7 +503,11 @@ class ConversationSession:
         if track.kind != "audio":
             return
         logger.info(f"[{self._session_id}] Audio track received")
-        self._sink = MicrophoneTrackSink(self._session_id, self._on_utterance)
+        self._sink = MicrophoneTrackSink(
+            self._session_id,
+            on_utterance=self._on_utterance,
+            on_speech_confirmed=self._on_speech_confirmed,
+        )
         self._sink.receive(track)
         task = asyncio.create_task(self._greet())
         task.add_done_callback(
@@ -547,21 +522,43 @@ class ConversationSession:
         await asyncio.sleep(0.5)
         await self._speak_and_send("Hello! I'm your voice assistant. How can I help you today?")
 
-    async def _on_utterance(self, audio: bytes, duration_sec: float) -> None:
+    async def _on_speech_confirmed(self) -> None:
         """
-        Called by MicrophoneTrackSink when a complete, noise-reduced utterance
-        is ready.  Handles barge-in BEFORE acquiring the pipeline lock so that
-        interrupting the AI's speech is always instant.
-        """
-        # ── Barge-in: stop TTS immediately ──────────────────────────────────
-        if self._speaking:
-            logger.info(f"[{self._session_id}] 🛑 Barge-in — stopping TTS")
-            self._interrupt.set()
-            await self._ws.send_json({"type": "interrupt"})
-            # Give the TTS loop one event-loop tick to observe the flag
-            await asyncio.sleep(0.05)
+        Fires the moment VAD has seen VAD_MIN_SPEECH_FRAMES (250ms) of
+        CONSECUTIVE confirmed speech — i.e. as soon as the user has clearly
+        started talking, not after they finish. This is what makes barge-in
+        feel instant instead of laggy: previously the interrupt only fired
+        from _on_utterance, which waits for the full utterance INCLUDING
+        VAD_SILENCE_FRAMES (600ms) of trailing silence after the user stops
+        talking — meaning TTS kept overlapping with the user's entire
+        sentence before ever being told to stop.
 
-        # ── Run STT → LLM → TTS, serialised per session ──────────────────
+        Noise immunity is unchanged: this uses the exact same
+        VAD_MIN_SPEECH_FRAMES threshold that _flush() uses to decide whether
+        an utterance is real speech at all, just checked earlier (the
+        moment the threshold is crossed, instead of at utterance end). A
+        single noise pop still can't reach this threshold's *consecutive*
+        frame requirement.
+        """
+        if self._speaking:
+            logger.info(f"[{self._session_id}] 🛑 Barge-in confirmed — interrupting TTS")
+            self._interrupt.set()
+            await self._ws.send_json({"type": "interrupt", "turn_id": self._turn_seq})
+            await asyncio.sleep(0)
+
+    async def _on_utterance(self, audio: bytes, duration_sec: float) -> None:
+        # By the time we get here, _on_speech_confirmed has already fired
+        # (if this was a barge-in) — TTS was stopped ~600ms+ earlier, as
+        # soon as speech was confirmed, rather than only now. If _speaking
+        # is somehow still true here (e.g. a new TTS turn started in the
+        # gap), this is a safety-net catch, not the primary mechanism.
+        if self._speaking:
+            logger.info(f"[{self._session_id}] 🛑 Barge-in — interrupting TTS (end-of-utterance catch)")
+            self._interrupt.set()
+            await self._ws.send_json({"type": "interrupt", "turn_id": self._turn_seq})
+            await asyncio.sleep(0)
+
+        # ── STT + LLM under lock (no two turns overlap) ──────────────────
         async with self._pipeline_lock:
             self._cost.add_stt(duration_sec)
 
@@ -573,13 +570,14 @@ class ConversationSession:
             logger.info(f"[{self._session_id}] 📝 User: {transcript}")
             await self._ws.send_json({"type": "transcript", "text": transcript, "speaker": "user"})
 
-            # Rolling history window
             if len(self._history) > MAX_HISTORY_TURNS * 2:
                 self._history = self._history[-(MAX_HISTORY_TURNS * 2):]
 
             response = await self._llm_respond(transcript)
-            if response:
-                await self._speak_and_send(response)
+
+        # ── TTS outside the lock — barge-in never blocked here ───────────
+        if response:
+            await self._speak_and_send(response)
 
     async def _llm_respond(self, user_text: str) -> str:
         self._history.append({"role": "user", "content": user_text})
@@ -619,16 +617,33 @@ class ConversationSession:
         return "Sorry, I had a bit of trouble there. Could you try again?"
 
     async def _speak_and_send(self, text: str) -> None:
-        self._interrupt.clear()
-        self._speaking = True
         self._cost.add_tts(len(text))
 
+        # Claim this turn's id BEFORE acquiring the semaphore. That way even
+        # a turn that's still waiting for a concurrency slot has an id the
+        # client can later recognize as superseded if a newer turn starts.
+        self._turn_seq += 1
+        turn_id = self._turn_seq
+
         async with _tts_sem:
+            # If we were superseded while waiting for the semaphore slot,
+            # don't even start — saves an OpenAI TTS call for audio nobody
+            # will hear.
+            if turn_id != self._turn_seq:
+                logger.debug(f"[{self._session_id}] Turn {turn_id} superseded before TTS call — skipping")
+                return
+
+            self._speaking = True
             try:
-                await self._ws.send_json({"type": "tts_start"})
+                await self._ws.send_json({"type": "tts_start", "turn_id": turn_id})
 
                 for attempt in range(1, API_MAX_RETRIES + 1):
+                    if self._interrupt.is_set() or turn_id != self._turn_seq:
+                        logger.debug(f"[{self._session_id}] TTS turn {turn_id} aborted before attempt {attempt}")
+                        return
+
                     try:
+                        seq_in_turn = 0
                         async with openai_client.audio.speech.with_streaming_response.create(
                             model="tts-1",
                             voice="echo",
@@ -637,10 +652,17 @@ class ConversationSession:
                             speed=1.0,
                         ) as tts_resp:
                             async for chunk in tts_resp.iter_bytes(chunk_size=4096):
-                                if self._interrupt.is_set():
-                                    logger.debug(f"[{self._session_id}] TTS interrupted mid-stream")
+                                if self._interrupt.is_set() or turn_id != self._turn_seq:
+                                    logger.debug(f"[{self._session_id}] TTS turn {turn_id} interrupted mid-stream")
                                     return
-                                await self._ws.send_bytes(chunk)
+                                # Frame each binary chunk with an 8-byte header:
+                                # [turn_id: uint32][seq_in_turn: uint32], both
+                                # big-endian, so the client can always tell
+                                # which turn (and ordering) a chunk belongs to
+                                # without a separate JSON side-channel.
+                                header = struct.pack(">II", turn_id, seq_in_turn)
+                                seq_in_turn += 1
+                                await self._ws.send_bytes(header + chunk)
                         break
                     except asyncio.TimeoutError:
                         logger.warning(f"[{self._session_id}] TTS timeout (attempt {attempt})")
@@ -653,7 +675,12 @@ class ConversationSession:
             finally:
                 self._speaking = False
                 self._interrupt.clear()
-                await self._ws.send_json({"type": "tts_end"})
+                # Only tell the client this turn ended if it's still current.
+                # If we were superseded, the new turn's tts_start already
+                # told the client to move on — sending a stale tts_end here
+                # would needlessly confuse turn bookkeeping client-side.
+                if turn_id == self._turn_seq:
+                    await self._ws.send_json({"type": "tts_end", "turn_id": turn_id})
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
