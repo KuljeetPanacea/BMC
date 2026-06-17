@@ -62,7 +62,7 @@ logger = logging.getLogger("webrtc_agent")
 OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
 DEEPGRAM_API_KEY     = os.getenv("DEEPGRAM_API_KEY", "")
 CARTESIA_API_KEY     = os.getenv("CARTESIA_API_KEY", "")
-CARTESIA_VOICE_ID    = os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091")
+CARTESIA_VOICE_ID    = os.getenv("CARTESIA_VOICE_ID", "faf0731e-dfb9-4cfc-8119-259a79b27e12")
 CARTESIA_MODEL       = os.getenv("CARTESIA_MODEL", "sonic-2")
 CARTESIA_SAMPLE_RATE = int(os.getenv("CARTESIA_SAMPLE_RATE", "22050"))
 
@@ -730,7 +730,7 @@ class ConversationSession:
                         sse_stream = await cartesia_client.tts.sse(
                             model_id=CARTESIA_MODEL,
                             transcript=text,
-                            voice={"id": CARTESIA_VOICE_ID},
+                            voice={"mode": "id", "id": CARTESIA_VOICE_ID},
                             output_format={
                                 "container":   "raw",
                                 "encoding":    "pcm_s16le",
