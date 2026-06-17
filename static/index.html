@@ -16,7 +16,6 @@
     --green:     #3ecf8e;
     --red:       #f0614a;
     --radius:    14px;
-    --mono:      'JetBrains Mono', 'Fira Mono', monospace;
     --sans:      'Inter', system-ui, sans-serif;
   }
 
@@ -37,6 +36,7 @@
     gap: 32px;
   }
 
+  /* ── Orb ── */
   .orb-wrap {
     position: relative;
     width: 140px;
@@ -44,23 +44,20 @@
     cursor: pointer;
     user-select: none;
   }
-
   .orb {
     width: 140px;
     height: 140px;
     border-radius: 50%;
     background: radial-gradient(circle at 38% 36%, #7b9bff 0%, #3a5af0 45%, #1a2a8f 100%);
-    box-shadow: 0 0 0 0 rgba(91,124,250,.4);
     transition: transform .15s ease, box-shadow .15s ease;
     display: flex;
     align-items: center;
     justify-content: center;
   }
-
   .orb svg { opacity: .85; }
   .orb-wrap:hover .orb { transform: scale(1.05); }
 
-  .orb-wrap.idle .orb { animation: idle-pulse 3s ease-in-out infinite; }
+  .orb-wrap.idle .orb      { animation: idle-pulse 3s ease-in-out infinite; }
   @keyframes idle-pulse {
     0%,100% { box-shadow: 0 0 0 0 rgba(91,124,250,.3); }
     50%      { box-shadow: 0 0 0 18px rgba(91,124,250,.0); }
@@ -89,6 +86,7 @@
     background: radial-gradient(circle at 38% 36%, #ff8f80 0%, #d63520 45%, #7a1008 100%);
   }
 
+  /* ── Status ── */
   .status-label {
     font-size: 13px;
     font-weight: 500;
@@ -103,6 +101,7 @@
   .status-label.speaking { color: var(--green); }
   .status-label.error    { color: var(--red); }
 
+  /* ── Transcript ── */
   .transcript-wrap {
     width: 100%;
     max-width: 560px;
@@ -111,7 +110,6 @@
     border-radius: var(--radius);
     overflow: hidden;
   }
-
   .transcript-header {
     padding: 10px 16px;
     border-bottom: 1px solid var(--border);
@@ -121,7 +119,6 @@
     text-transform: uppercase;
     color: var(--muted);
   }
-
   .transcript-body {
     height: 220px;
     overflow-y: auto;
@@ -131,7 +128,6 @@
     gap: 10px;
     scroll-behavior: smooth;
   }
-
   .transcript-body::-webkit-scrollbar { width: 4px; }
   .transcript-body::-webkit-scrollbar-track { background: transparent; }
   .transcript-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
@@ -139,25 +135,15 @@
   .msg { display: flex; flex-direction: column; gap: 3px; max-width: 88%; }
   .msg.user  { align-self: flex-end; align-items: flex-end; }
   .msg.agent { align-self: flex-start; align-items: flex-start; }
-
-  .msg-label {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: .07em;
-    text-transform: uppercase;
-    color: var(--muted);
-  }
-
+  .msg-label { font-size: 10px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
   .msg-bubble {
     padding: 8px 12px;
     border-radius: 10px;
     font-size: 14px;
     line-height: 1.5;
   }
-
   .msg.user  .msg-bubble { background: var(--accent-lo); border: 1px solid var(--accent); color: var(--text); }
   .msg.agent .msg-bubble { background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text); }
-
   .msg-bubble.interrupted { opacity: .55; }
   .msg-bubble.interrupted::after {
     content: " (interrupted)";
@@ -166,8 +152,8 @@
     color: var(--muted);
   }
 
+  /* ── Controls ── */
   .controls { display: flex; gap: 12px; align-items: center; }
-
   .btn {
     padding: 10px 22px;
     border-radius: 8px;
@@ -187,6 +173,7 @@
   .btn.danger   { background: rgba(240,97,74,.12); border-color: var(--red); color: var(--red); }
   .btn.danger:hover  { background: rgba(240,97,74,.22); }
 
+  /* ── Input vol bar ── */
   .vol-bar-wrap {
     width: 100%;
     max-width: 560px;
@@ -207,9 +194,15 @@
   }
 
   .footer { font-size: 11px; color: var(--muted); text-align: center; }
+
+  /* Hidden audio element for WebRTC output track */
+  #remoteAudio { display: none; }
 </style>
 </head>
 <body>
+
+<!-- WebRTC output track plays here — browser handles AEC + jitter buffer -->
+<audio id="remoteAudio" autoplay playsinline></audio>
 
 <div class="orb-wrap idle" id="orb" title="Click to start / stop">
   <div class="orb">
@@ -253,29 +246,9 @@ let micCtx      = null;
 let analyser    = null;
 let volRaf      = null;
 let firstMsg    = true;
-
-// ─── TTS playback (raw PCM s16le from Cartesia SSE) ──────────────────────────
-// Cartesia's SSE endpoint only supports raw PCM output (container=raw,
-// encoding=pcm_s16le). We can't feed raw PCM into decodeAudioData() — that
-// only accepts complete encoded files (mp3/wav/ogg). Instead we:
-//   1. Convert each chunk's Int16 samples → Float32
-//   2. Create an AudioBuffer directly (no decode needed — it's already PCM)
-//   3. Schedule it gaplessly on a shared AudioContext using nextStartTime
-//
-// Turn-gating and barge-in logic (playGen, currentTurnId, masterGain) are
-// identical to the previous mp3 version — only the chunk→AudioBuffer
-// conversion changes.
-
-let playCtx       = null;
-let masterGain    = null;
+// UI state for TTS (no audio scheduling needed — WebRTC track handles it)
 let currentTurnId = -1;
-let nextStartTime = 0;
-let activeSources = [];
 let turnMsgEl     = null;
-let playGen       = 0;
-
-// Sample rate sent by server in tts_start message (default 22050)
-let ttsSampleRate = 22050;
 
 const orb            = document.getElementById("orb");
 const statusLabel    = document.getElementById("statusLabel");
@@ -284,6 +257,7 @@ const volBar         = document.getElementById("volBar");
 const transcriptBody = document.getElementById("transcriptBody");
 const startBtn       = document.getElementById("startBtn");
 const stopBtn        = document.getElementById("stopBtn");
+const remoteAudio    = document.getElementById("remoteAudio");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function setStatus(text, cls = "") {
@@ -320,7 +294,7 @@ function startVolMeter(stream) {
   volWrap.classList.add("active");
   function tick() {
     analyser.getByteFrequencyData(data);
-    const avg = data.reduce((a,b) => a+b, 0) / data.length;
+    const avg = data.reduce((a, b) => a + b, 0) / data.length;
     volBar.style.width = Math.min(100, avg * 2) + "%";
     volRaf = requestAnimationFrame(tick);
   }
@@ -334,157 +308,46 @@ function stopVolMeter() {
   if (micCtx) { micCtx.close(); micCtx = null; }
 }
 
-// ─── AudioContext setup ───────────────────────────────────────────────────────
-function ensurePlayCtx() {
-  if (!playCtx) {
-    playCtx    = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: ttsSampleRate });
-    masterGain = playCtx.createGain();
-    masterGain.gain.value = 1;
-    masterGain.connect(playCtx.destination);
-  }
-  if (playCtx.state === "suspended") playCtx.resume().catch(() => {});
-  return playCtx;
-}
-
-function stopAllActiveSources() {
-  if (masterGain && playCtx) {
-    masterGain.gain.cancelScheduledValues(playCtx.currentTime);
-    masterGain.gain.setValueAtTime(0, playCtx.currentTime);
-  }
-  for (const src of activeSources) {
-    try { src.stop(); } catch(e) {}
-  }
-  activeSources = [];
-  if (masterGain && playCtx) {
-    masterGain.gain.setValueAtTime(1, playCtx.currentTime);
-  }
-}
-
-// ─── Convert raw pcm_s16le bytes → AudioBuffer (NO decodeAudioData needed) ───
-// This is the KEY change from the mp3 version. Raw PCM doesn't need decoding —
-// we just reinterpret the bytes as Int16 samples and normalize to Float32 [-1,1].
-function pcmBytesToAudioBuffer(arrayBuffer, sampleRate) {
-  const int16   = new Int16Array(arrayBuffer);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768.0;   // normalize s16 → float [-1, 1]
-  }
-  const ctx    = ensurePlayCtx();
-  const buffer = ctx.createBuffer(1, float32.length, sampleRate);
-  buffer.copyToChannel(float32, 0);
-  return buffer;
-}
-
-// ─── Schedule one PCM chunk for gapless playback ─────────────────────────────
-function scheduleChunk(arrayBuffer, turnId, gen) {
-  // Both checks must pass — gen covers the race between "chunk arrives" and
-  // "interrupt fires", turnId covers cross-turn confusion.
-  if (gen !== playGen || turnId !== currentTurnId) return;
-
-  const ctx    = ensurePlayCtx();
-  // Strip the 8-byte header [turn_id u32][seq u32] — remaining bytes are PCM
-  const pcmBuf = arrayBuffer.slice(8);
-  if (pcmBuf.byteLength === 0) return;
-
-  const audioBuffer = pcmBytesToAudioBuffer(pcmBuf, ttsSampleRate);
-
-  const source = ctx.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(masterGain);
-
-  const startAt  = Math.max(nextStartTime, ctx.currentTime);
-  source.start(startAt);
-  nextStartTime  = startAt + audioBuffer.duration;
-
-  activeSources.push(source);
-  source.onended = () => {
-    activeSources = activeSources.filter(s => s !== source);
-    // All chunks for this turn have finished playing → flip back to listening
-    if (activeSources.length === 0 && turnId === currentTurnId && gen === playGen) {
-      setOrbState("listening");
-      setStatus("Listening…", "active");
-    }
-  };
-}
-
-// ─── TTS event handlers ───────────────────────────────────────────────────────
-function onTtsStart(msg) {
-  playGen += 1;
-
-  // Update sample rate from server message (sent in tts_start)
-  if (msg.sample_rate) ttsSampleRate = msg.sample_rate;
-
-  if (turnMsgEl) markBubbleInterrupted(turnMsgEl);
-  stopAllActiveSources();
-
-  currentTurnId = msg.turn_id;
-  const ctx     = ensurePlayCtx();
-  nextStartTime = ctx.currentTime;
-  turnMsgEl     = null;
-
-  setOrbState("speaking");
-  setStatus("Agent speaking…", "speaking");
-}
-
-function onTtsEnd(turnId) {
-  if (turnId !== currentTurnId) return;
-  if (activeSources.length === 0) {
-    setOrbState("listening");
-    setStatus("Listening…", "active");
-  }
-}
-
-function onInterrupt(turnId) {
-  playGen += 1;
-  if (turnId === currentTurnId || turnId === -1) markBubbleInterrupted(turnMsgEl);
-  stopAllActiveSources();
-  setOrbState("listening");
-  setStatus("Listening…", "active");
-  currentTurnId = -1;
-}
-
-// ─── Binary message handler ───────────────────────────────────────────────────
-// Raw PCM path: no async decode, no queue needed.
-// pcmBytesToAudioBuffer() is synchronous so there's zero race window —
-// the gen/turnId checks and the schedule happen in the same microtask.
-function handleAudioChunk(buf) {
-  if (buf.byteLength < 8) return;
-  const view   = new DataView(buf);
-  const turnId = view.getUint32(0, false);   // big-endian matches server ">II"
-  if (turnId !== currentTurnId) return;      // stale turn — drop immediately
-  scheduleChunk(buf, turnId, playGen);
-}
-
-function resetTtsPlaybackState() {
-  playGen += 1;
-  stopAllActiveSources();
-  currentTurnId = -1;
-  nextStartTime = 0;
-  turnMsgEl     = null;
-}
-
-// ─── WebSocket ────────────────────────────────────────────────────────────────
+// ─── WebSocket (signaling + JSON control messages only — no binary audio) ─────
 async function openWebSocket() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
- // ws           = new WebSocket(`${proto}://${location.host}/ws`);
-  ws           = new WebSocket(`${proto}://${location.host}/bmc/ws`);
-  ws.binaryType = "arraybuffer";
+  // ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws = new WebSocket(`${proto}://${location.host}/bmc/ws`);
 
   return new Promise((resolve, reject) => {
     ws.onopen  = () => resolve();
     ws.onerror = (e) => reject(e);
 
     ws.onmessage = async (ev) => {
-      if (ev.data instanceof ArrayBuffer) {
-        handleAudioChunk(ev.data);
-        return;
+      // All messages are JSON now — no binary audio over WebSocket
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+
+      if (msg.type === "answer") {
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: msg.sdp_type, sdp: msg.sdp }));
       }
-      const msg = JSON.parse(ev.data);
-      if      (msg.type === "answer")     { await pc.setRemoteDescription(new RTCSessionDescription({ type: msg.sdp_type, sdp: msg.sdp })); }
-      else if (msg.type === "transcript") { const b = addMessage(msg.text, msg.speaker); if (msg.speaker === "agent") turnMsgEl = b; }
-      else if (msg.type === "tts_start")  { onTtsStart(msg); }
-      else if (msg.type === "tts_end")    { onTtsEnd(msg.turn_id); }
-      else if (msg.type === "interrupt")  { onInterrupt(msg.turn_id); }
+      else if (msg.type === "transcript") {
+        const b = addMessage(msg.text, msg.speaker);
+        if (msg.speaker === "agent") turnMsgEl = b;
+      }
+      else if (msg.type === "tts_start") {
+        currentTurnId = msg.turn_id;
+        setOrbState("speaking");
+        setStatus("Agent speaking…", "speaking");
+      }
+      else if (msg.type === "tts_end") {
+        if (msg.turn_id === currentTurnId) {
+          setOrbState("listening");
+          setStatus("Listening…", "active");
+        }
+      }
+      else if (msg.type === "interrupt") {
+        markBubbleInterrupted(turnMsgEl);
+        turnMsgEl     = null;
+        currentTurnId = -1;
+        setOrbState("listening");
+        setStatus("Listening…", "active");
+      }
     };
 
     ws.onclose = () => {
@@ -504,7 +367,17 @@ async function startWebRTC(stream) {
     ]
   });
 
+  // Send mic audio to server
   stream.getAudioTracks().forEach(t => pc.addTrack(t, stream));
+
+  // Receive TTS audio FROM server via WebRTC track.
+  // The browser handles AEC, jitter buffer, and decoding automatically.
+  pc.ontrack = (event) => {
+    if (event.streams && event.streams[0]) {
+      remoteAudio.srcObject = event.streams[0];
+      remoteAudio.play().catch(() => {});
+    }
+  };
 
   pc.onicecandidate = ({ candidate }) => {
     if (candidate && ws?.readyState === WebSocket.OPEN) {
@@ -517,13 +390,13 @@ async function startWebRTC(stream) {
     if (pc.connectionState === "connected") {
       setStatus("Listening…", "active");
       setOrbState("listening");
-    } else if (["failed","disconnected","closed"].includes(pc.connectionState)) {
+    } else if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
       setStatus("Connection lost", "error");
       setOrbState("error");
     }
   };
 
-  const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+  const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
   await pc.setLocalDescription(offer);
   ws.send(JSON.stringify({ type: "offer", sdp: offer.sdp, sdp_type: offer.type }));
 }
@@ -531,22 +404,27 @@ async function startWebRTC(stream) {
 // ─── Session start / stop ─────────────────────────────────────────────────────
 async function startSession() {
   startBtn.disabled = true;
-  setStatus("Requesting microphone…", "");
+  setStatus("Requesting microphone…");
 
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 16000 },
-      video: false
+      audio: {
+        echoCancellation:  true,
+        noiseSuppression:  true,
+        autoGainControl:   true,
+        channelCount:      1,
+        sampleRate:        16000,
+      },
+      video: false,
     });
-  } catch(e) {
+  } catch {
     setStatus("Microphone access denied", "error");
     setOrbState("error");
     startBtn.disabled = false;
     return;
   }
 
-  setStatus("Connecting…", "");
-  ensurePlayCtx();   // create inside click gesture so autoplay is allowed
+  setStatus("Connecting…");
 
   try {
     await openWebSocket();
@@ -555,7 +433,7 @@ async function startSession() {
     stopBtn.disabled = false;
     setOrbState("listening");
     setStatus("Connecting WebRTC…", "active");
-  } catch(e) {
+  } catch (e) {
     console.error(e);
     setStatus("Connection failed — is the server running?", "error");
     setOrbState("error");
@@ -575,9 +453,10 @@ async function stopSession() {
   if (pc)          { pc.close(); pc = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   stopVolMeter();
-  resetTtsPlaybackState();
-  if (playCtx) { playCtx.close(); playCtx = null; masterGain = null; }
-  setStatus("Session ended", "");
+  remoteAudio.srcObject = null;
+  currentTurnId = -1;
+  turnMsgEl     = null;
+  setStatus("Session ended");
   setOrbState("idle");
   resetUI();
 }
